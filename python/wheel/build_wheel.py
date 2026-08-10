@@ -30,6 +30,7 @@ Three things make this work, and they are the whole point of the prototype:
    #1700 and already done by the Java bindings - left as follow-up.)
 """
 
+import argparse
 import os
 import re
 import shutil
@@ -76,18 +77,30 @@ LOADER = '''\
 # --- wheel patch: load the bundled library, not a system one ---------------
 # Replaces `_loader["<soname>"]`. A wheel must bind to the exact liblouis it
 # ships: a system copy may be built with a different charSize, and that is an
-# ABI mismatch, not a translation difference. Resolved by glob because
-# auditwheel may rename the file when it vendors dependencies.
+# ABI mismatch, not a translation difference. Resolved by glob rather than by
+# name because auditwheel may rename the file when it vendors dependencies,
+# and the extension differs per platform (.so / .dll / .dylib).
 import glob as _glob
 import os as _os
 
 _pkgdir = _os.path.dirname(_os.path.abspath(__file__))
-_candidates = sorted(_glob.glob(_os.path.join(_pkgdir, "_lib", "liblouis*.so*")))
+_libdir = _os.path.join(_pkgdir, "_lib")
+_candidates = sorted(
+    _glob.glob(_os.path.join(_libdir, "liblouis*.so*"))
+    + _glob.glob(_os.path.join(_libdir, "*louis*.dll"))
+    + _glob.glob(_os.path.join(_libdir, "liblouis*.dylib"))
+)
 if not _candidates:
     raise ImportError(
-        f"bundled liblouis library missing from {_pkgdir}/_lib; "
-        f"this wheel is corrupt"
+        f"bundled liblouis library missing from {_libdir}; this wheel is corrupt"
     )
+if platform == "win32":
+    # NB: _is_windows is defined *below* this point in the upstream module,
+    # so test `platform` (imported from sys above) instead. Windows resolves
+    # a DLL's own dependencies relative to its directory only if that
+    # directory is registered - harmless when the DLL is fully static,
+    # required as soon as it is not.
+    _os.add_dll_directory(_libdir)
 # Tables ship with the wheel. Set before any table is compiled; os.environ
 # writes through to putenv, so the C library's getenv sees it.
 _os.environ.setdefault("LOUIS_TABLEPATH", _os.path.join(_pkgdir, "_tables"))
@@ -104,13 +117,13 @@ def run(cmd, **kw):
     subprocess.run(cmd, check=True, env=env, **kw)
 
 
-def stage():
+def stage(build):
     if STAGE.exists():
         shutil.rmtree(STAGE)
     (STAGE / "louis" / "_lib").mkdir(parents=True)
 
     # 1. the bindings, with the loader repointed at the bundled library
-    generated = ROOT / "python" / "louis" / "__init__.py"
+    generated = build / "python" / "louis" / "__init__.py"
     if not generated.exists():
         sys.exit(f"{generated} missing - run ./configure && make first")
     source = generated.read_text()
@@ -120,15 +133,31 @@ def stage():
         sys.exit("could not find the ctypes loader line to patch")
     (STAGE / "louis" / "__init__.py").write_text(patched)
 
-    # 2. the shared library (real file, not the symlinks)
-    libs = sorted((ROOT / "liblouis" / ".libs").glob("liblouis.so.*.*.*"))
+    # 2. the shared library. Real files only - .so.N.N.N on Linux is the
+    #    target of two symlinks we must not copy; Windows gives a plain .dll.
+    libdir = build / "liblouis" / ".libs"
+    libs = [p for p in sorted(libdir.glob("*louis*"))
+            if not p.is_symlink()
+            and (re.search(r"\.so\.\d+\.\d+\.\d+$", p.name) or p.suffix == ".dll")]
     if not libs:
-        sys.exit("no built library in liblouis/.libs - run make first")
+        sys.exit(f"no built library in {libdir} - run make first")
     shutil.copy2(libs[0], STAGE / "louis" / "_lib" / libs[0].name)
 
-    # 3. the translation tables
-    shutil.copytree(ROOT / "tables", STAGE / "louis" / "_tables",
+    # 3. the translation tables. Two of them (nl-NL-g0.utb, nl-chardefs.uti)
+    #    are GENERATED from .in templates at build time and land in the build
+    #    tree, not the source tree - so overlay the build tree's copies.
+    #    Without this an out-of-tree build silently ships without them.
+    tables = STAGE / "louis" / "_tables"
+    shutil.copytree(ROOT / "tables", tables,
                     ignore=shutil.ignore_patterns("Makefile*", "*.am", "*.in"))
+    generated = 0
+    if (build / "tables") != (ROOT / "tables"):
+        for made in (build / "tables").iterdir():
+            if made.is_file() and made.suffix in (".utb", ".uti", ".ctb", ".dis", ".cti"):
+                shutil.copy2(made, tables / made.name)
+                generated += 1
+    print(f"tables: {len(list(tables.iterdir()))} "
+          f"({generated} generated, taken from the build tree)")
 
     # 4. licences, so the redistributed library and tables carry their terms
     for name in ("COPYING", "COPYING.LESSER"):
@@ -141,23 +170,41 @@ def stage():
 
 
 def main():
-    version = stage()
-    tables = len(list((STAGE / "louis" / "_tables").rglob("*")))
-    print(f"staged liblouis {version}: {tables} table files")
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--build-dir", type=Path, default=ROOT,
+                        help="configured build tree (default: the source root)")
+    parser.add_argument("--plat-tag", default="linux_x86_64",
+                        help="wheel platform tag, e.g. win_amd64")
+    args = parser.parse_args()
 
-    if DIST.exists():
-        shutil.rmtree(DIST)
+    build = args.build_dir.resolve()
+    version = stage(build)
+    tables = len(list((STAGE / "louis" / "_tables").rglob("*")))
+    lib = next((STAGE / "louis" / "_lib").iterdir())
+    print(f"staged liblouis {version}: {lib.name}, {tables} table files")
+
+    # Clear only this target's artefacts, so wheels for other platforms
+    # built earlier survive alongside it.
+    DIST.mkdir(exist_ok=True)
+    for stale in list(DIST.glob("*-any.whl")) + list(DIST.glob(f"*{args.plat_tag}.whl")):
+        stale.unlink()
     run([VENV / "python", "-m", "build", "--wheel", "--outdir", DIST], cwd=STAGE)
 
-    built = next(DIST.glob("*.whl"))
+    # Specifically the wheel just built, not whichever the glob yields first:
+    # other platforms' wheels now live in dist/ alongside it.
+    built = next(DIST.glob("*-any.whl"))
     # setuptools tags this for the building interpreter; retag it as
     # ABI-agnostic, which is what a pure-ctypes package actually is.
     run([VENV / "python", "-m", "wheel", "tags", "--python-tag", "py3",
-         "--abi-tag", "none", "--platform-tag", "linux_x86_64",
+         "--abi-tag", "none", "--platform-tag", args.plat_tag,
          "--remove", built])
 
-    retagged = next(DIST.glob("*py3-none-linux_x86_64.whl"))
-    run([VENV / "auditwheel", "repair", "--wheel-dir", DIST, retagged])
+    if args.plat_tag.startswith("linux"):
+        # auditwheel vendors the library's own dependencies and relabels the
+        # wheel manylinux. There is no equivalent step for the MinGW build,
+        # which is linked -static-libgcc and depends only on system DLLs.
+        retagged = next(DIST.glob(f"*py3-none-{args.plat_tag}.whl"))
+        run([VENV / "auditwheel", "repair", "--wheel-dir", DIST, retagged])
     print("\nwheels:")
     for whl in sorted(DIST.glob("*.whl")):
         print(f"  {whl.name}  ({whl.stat().st_size // 1024} KiB)")
