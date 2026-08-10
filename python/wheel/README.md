@@ -49,6 +49,60 @@ not yet tested here.)
 **3. "Ensure the correct dll (32 or 64 bit)" needs no runtime logic** — that
 is what platform tags do; pip picks the right wheel.
 
+## Python version floor: 3.10, and it's real
+
+Verified by installing the wheel into clean venvs:
+
+| Python | result |
+|---|---|
+| 3.8, 3.9 | `TypeError: unsupported operand type(s) for \|: 'type' and 'type'` |
+| 3.10 – 3.14 | works |
+
+The bindings use PEP 604 unions in signatures (`typeform: Iterable[int] |
+None = None`). That is valid *syntax* on any version — `py_compile` passes on
+3.8 — but the annotation is evaluated at function-definition time, so it
+raises at import on <3.10. Upstream's `requires-python = ">=3.10"` is
+therefore correct, not conservative.
+
+Supporting older Pythons would mean `from __future__ import annotations` or
+quoted annotations in the bindings, not anything about the build. Since
+3.9 is already EOL, it isn't worth it — and note the cost of a wider range
+is *zero extra build time* here: one `py3-none` artifact covers whatever
+range the metadata allows.
+
+## Windows: cross-compiled from Linux, already UCS-4
+
+`.github/workflows/mingw.yml` already cross-compiles Windows from a Linux
+runner (`x86_64-w64-mingw32`), and **already passes `--enable-ucs4`** — the
+same choice made here, so charSize is consistent across platforms today.
+Calling conventions line up too: `liblouis.h.in` defines
+`EXPORT_CALL __stdcall` on Windows, which matches the bindings' `windll` /
+`WINFUNCTYPE` branch.
+
+Two consequences:
+
+- A Windows wheel needs **no Windows runner** — the same Linux CI job that
+  builds the Linux wheel can produce `win_amd64`, with `delvewheel` bundling
+  the MinGW runtime DLLs (`libwinpthread-1.dll` etc.) or `-static-libgcc`
+  avoiding them.
+- The 32-bit (`i686-w64-mingw32`) job in that workflow is **commented out**,
+  so upstream effectively ships 64-bit Windows only. `win32` need not be a
+  target unless someone asks.
+
+## UCS-2 vs UCS-4 is already settled in practice
+
+Both builds observed in the wild are UCS-4: upstream's own MinGW CI, and
+Debian's `liblouis20` (`wideCharBytes == 4`). The bindings adapt
+automatically — `conversionEncoding = "utf_%d_%s" % (wideCharBytes * 8,
+endianness)` — so the choice is invisible to callers *except* for non-BMP
+input: under UCS-2 an astral character encodes to a surrogate pair, and
+`inlen = len(buf) // wideCharBytes` then presents it to liblouis as two lone
+surrogates rather than one character.
+
+So: build UCS-4 everywhere, ship one variant, and don't expose it as an
+option. A UCS-2 wheel would differ semantically from every other liblouis
+build in circulation.
+
 ## Design notes
 
 - **The soname macro is untouched.** `_loader["###LIBLOUIS_SONAME###"]` is
