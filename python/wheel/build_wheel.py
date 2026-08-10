@@ -62,6 +62,10 @@ classifiers = [
 [tool.setuptools]
 packages = ["louis"]
 include-package-data = true
+# The wheel redistributes the liblouis shared library and the tables, so the
+# licences must travel with it. COPYING is GPL-3 (programs), COPYING.LESSER is
+# LGPL-2.1 (the library and the tables).
+license-files = ["COPYING", "COPYING.LESSER"]
 
 [tool.setuptools.package-data]
 louis = ["_lib/*", "_tables/**"]
@@ -125,6 +129,10 @@ def stage():
     # 3. the translation tables
     shutil.copytree(ROOT / "tables", STAGE / "louis" / "_tables",
                     ignore=shutil.ignore_patterns("Makefile*", "*.am", "*.in"))
+
+    # 4. licences, so the redistributed library and tables carry their terms
+    for name in ("COPYING", "COPYING.LESSER"):
+        shutil.copy2(ROOT / name, STAGE / name)
 
     version = (ROOT / "configure.ac").read_text()
     version = re.search(r"AC_INIT\(\[[^\]]+\],\s*\[([^\]]+)\]", version).group(1)
