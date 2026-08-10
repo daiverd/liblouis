@@ -103,6 +103,42 @@ So: build UCS-4 everywhere, ship one variant, and don't expose it as an
 option. A UCS-2 wheel would differ semantically from every other liblouis
 build in circulation.
 
+## Table lookup: why `LOUIS_TABLEPATH` cannot be used
+
+Setting `LOUIS_TABLEPATH` from Python **does not work on Windows**, confirmed
+by testing this wheel on real Windows (Python 3.11.9): every table lookup
+failed with `Cannot resolve table 'en-ueb-g2.ctb'` even though `os.environ`
+showed the variable set and all 474 tables were present.
+
+The cause is a CRT split. `liblouis.dll` links **msvcrt**, the legacy C
+runtime, which snapshots its own environment block when it initialises.
+CPython 3.11 is a **ucrt** process, so `os.environ` writes go to a different
+block and the library's `getenv` never sees them. Setting the variable in the
+shell *before* launching Python works, because then it is inherited at
+process start — but a wheel cannot rely on that. This is upstream #1299,
+with a mechanism.
+
+The fix is in `_createTableBuf`, the single function every entry point taking
+a `tableList` funnels through: bare table names are resolved to absolute
+paths inside the bundled `_tables` directory before being handed to the
+library. Absolute paths sidestep the lookup entirely, and liblouis still
+resolves each table's `include` directives relative to the table's own
+directory.
+
+This is simpler than the `lou_registerTableResolver` callback suggested in
+#1700, and avoids having to keep a ctypes callback alive for the process
+lifetime — though the callback remains the better answer for upstream, since
+it would also cover tables the caller supplies from elsewhere.
+
+Verified on Linux, including the case that reproduces the Windows failure:
+
+| case | result |
+|---|---|
+| normal use | works |
+| `LOUIS_TABLEPATH` deleted after import | works — proves lookup no longer depends on it |
+| caller passes an absolute path | passed through untouched |
+| user sets `LOUIS_TABLEPATH` before import | respected; bundled tables are *not* substituted |
+
 ## Design notes
 
 - **The soname macro is untouched.** `_loader["###LIBLOUIS_SONAME###"]` is
@@ -120,10 +156,7 @@ build in circulation.
 
 ## Known gaps before this is shippable
 
-- **Tables are found via `LOUIS_TABLEPATH`.** `lou_setDataPath` is
-  deprecated upstream. The production fix is a custom table resolver via
-  `lou_registerTableResolver`, as suggested in #1700 and already done by the
-  Java bindings — that also settles #1299 and #1701.
+- ~~Tables are found via `LOUIS_TABLEPATH`.~~ **Fixed** — see below.
 - **`Root-Is-Purelib: true`** in the generated wheel; should be false for a
   wheel carrying a shared library.
 - **`manylinux_2_34`** reflects this build host's glibc. Real builds belong

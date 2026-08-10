@@ -1,11 +1,23 @@
 # Testing the win_amd64 liblouis wheel
 
 Instructions for verifying `liblouis-3.38.0-py3-none-win_amd64.whl` on real
-Windows. It was **cross-compiled from Linux with mingw-w64 and has never been
-run on Windows** — that is exactly what this is checking.
+Windows. It is cross-compiled from Linux with mingw-w64, so every run on
+Windows is the first real test of it.
 
 Written for an agent working on the Windows side. Please run it as given and
 report the full output, pass or fail.
+
+> **Round 2.** Round 1 passed checks 1–4 and failed 5–8 with
+> `Cannot resolve table 'en-ueb-g2.ctb'`. Root cause, diagnosed from that
+> report: `liblouis.dll` links **msvcrt** and snapshots its own environment
+> block, so a **ucrt** Python's `os.environ["LOUIS_TABLEPATH"]` never reached
+> the library's `getenv`.
+>
+> The wheel no longer uses that environment variable to find tables. Bare
+> table names are now resolved to absolute paths inside the bundled
+> `_tables` directory, in `_createTableBuf`. **Reinstall the wheel before
+> retesting** — and please do *not* set `LOUIS_TABLEPATH` in the shell this
+> time, since the point is that it should work without it.
 
 ## What is being tested, and why it might fail
 

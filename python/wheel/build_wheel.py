@@ -101,11 +101,44 @@ if platform == "win32":
     # directory is registered - harmless when the DLL is fully static,
     # required as soon as it is not.
     _os.add_dll_directory(_libdir)
-# Tables ship with the wheel. Set before any table is compiled; os.environ
-# writes through to putenv, so the C library's getenv sees it.
-_os.environ.setdefault("LOUIS_TABLEPATH", _os.path.join(_pkgdir, "_tables"))
+# Tables ship with the wheel. The env var is set for any code that reads it
+# directly, but it is NOT how tables are found - see _createTableBuf below.
+_bundled_tables = _os.path.join(_pkgdir, "_tables")
+_user_tablepath = bool(_os.environ.get("LOUIS_TABLEPATH"))
+_os.environ.setdefault("LOUIS_TABLEPATH", _bundled_tables)
 liblouis = _loader[_candidates[0]]
 # --- end wheel patch -------------------------------------------------------
+'''
+
+# Replaces the whole of _createTableBuf, the single point every entry taking a
+# tableList funnels through.
+TABLE_RESOLVER = '''\
+def _createTableBuf(tablesList: TableListT) -> Array[c_char]:
+    """Creates a tables string for liblouis calls.
+
+    Wheel patch: bare table names are resolved to absolute paths inside the
+    bundled _tables directory, rather than left for liblouis to look up.
+
+    LOUIS_TABLEPATH cannot be relied on from Python. On Windows the library
+    links msvcrt, the legacy CRT, which snapshots its own environment block at
+    initialisation; a ucrt Python's os.environ writes never reach that copy,
+    so the library's getenv does not see the path (upstream #1299). Absolute
+    paths sidestep the lookup entirely, and liblouis still resolves each
+    table's `include` directives relative to the table's own directory.
+
+    Anything the caller supplies that already exists as a path is left alone,
+    as is everything if LOUIS_TABLEPATH was set before this module was
+    imported - that is a deliberate choice of tables and must win.
+    """
+    resolved = []
+    for entry in tablesList:
+        name = entry.decode(fileSystemEncoding) if isinstance(entry, bytes) else entry
+        if not _user_tablepath and not _os.path.exists(name):
+            bundled = _os.path.join(_bundled_tables, name)
+            if _os.path.exists(bundled):
+                name = bundled
+        resolved.append(name.encode(fileSystemEncoding))
+    return create_string_buffer(b",".join(resolved))
 '''
 
 
@@ -131,6 +164,17 @@ def stage(build):
                              source, count=1, flags=re.MULTILINE)
     if count != 1:
         sys.exit("could not find the ctypes loader line to patch")
+
+    # Swap out _createTableBuf entirely: splice between its def and the next
+    # top-level statement, rather than pattern-matching its body.
+    start = patched.find("def _createTableBuf")
+    if start == -1:
+        sys.exit("could not find _createTableBuf to patch")
+    end = patched.find("\ndef ", start)
+    if end == -1:
+        sys.exit("could not find the end of _createTableBuf")
+    patched = patched[:start] + TABLE_RESOLVER + patched[end + 1:]
+
     (STAGE / "louis" / "__init__.py").write_text(patched)
 
     # 2. the shared library. Real files only - .so.N.N.N on Linux is the
